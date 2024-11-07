@@ -2,70 +2,80 @@
 
 import rclpy
 from rclpy.node import Node
-import can
+import serial
 from custom_messages.msg import EncoderFeedback, MotorCommand, ServoCommand, PwmCommand, DigitalAndSolenoidCommand, DigitalAndAnalogFeedback
 import struct
 import subprocess
 import array
-import signal
-import time
+
+class can_msg:
+    def __init__(self, arbitration_id = 0, dlc = 8, data = [0, 0, 0, 0, 0, 0, 0, 0]):
+        self.arbitration_id = arbitration_id
+        self.dlc = dlc
+        self.data = data
+        self.serial_data = array.array('B', [0] * 13)
+        self.serial_size = 13
+
+    def convert_can_msg_to_serial(self, can_message):
+        self.serial_data[0] = 0xFF
+        self.serial_data[1] = can_message.arbitration_id >> 8
+        self.serial_data[2] = can_message.arbitration_id & 0xFF
+        self.serial_data[3] = can_message.dlc
+        self.serial_data[4:12] = array.array('B', can_message.data)
+        self.serial_data[12] = 0xFF
+
+        return self.serial_data
+    
+    def convert_serial_to_can_msg(self, data):
+        if data[0] == 0xFF and data[12] == 0xFF:
+            self.arbitration_id = (data[1] << 8) | data[2]
+            self.dlc = data[3]
+            self.data = data[4:12]
+            return True
+        else:
+            return False
+
+class serial_buffer:
+    def __init__(self, buffer_size):
+        self.buffer_size = buffer_size
+        self.data = array.array('B', [0] * buffer_size)
+        self.head = 0
+        self.tail = 0
+
+    def push(self, data):
+        length = len(data)
+        head_index = self.head % self.buffer_size
+
+        if head_index + length <= self.buffer_size:
+            self.data[head_index:head_index + length] = array.array('B', data)
+        else:
+            first_part = self.buffer_size - head_index
+            self.data[head_index:] = array.array('B', data[:first_part])
+            self.data[:length - first_part] = array.array('B', data[first_part:])
+        
+        self.head += length
+
+    def read(self, tail, length):
+        tail_index = tail % self.buffer_size
+     
+        if tail_index + length <= self.buffer_size:
+            return self.data[tail_index:tail_index + length]
+        else:
+            first_part = self.buffer_size - tail_index
+            return self.data[tail_index:] + self.data[:length - first_part]
 
 def run_subprocess(cmd):
     """Executes a command in the subprocess and returns the result."""
     return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-class CanDriver(Node, can.Listener):
-    def __init__(self):
-        Node.__init__(self, 'can_driver_node')
-        self.error_timer = time.perf_counter()
-        
-        self.setup_can_interface()
+class CanDriver(Node):
+    def __init__(self, serial_port = "/dev/ttyUSB0"):
+        Node.__init__(self, 'can_driver_node')  # Changed node name to MotorNode
+        self.serial_port = serial_port
+        self.setup_serial_interface()
         self.init_publisher()
         self.init_subscriber()
-        self.shutdown_requested = False
-        
-        # Set up signal handlers
-        signal.signal(signal.SIGINT, self.signal_handler)
-        signal.signal(signal.SIGTERM, self.signal_handler)
-
-    def setup_can_interface(self):
         self.canMsgData = [0, 0, 0, 0, 0, 0, 0, 0]
-
-        try:
-            """Checks and sets up the CAN interface."""
-            result = run_subprocess(["ip", "link", "show", "can0"])
-            if b"state UP" in result.stdout:
-                self.get_logger().info("CAN interface is already up")
-            else:
-                result = run_subprocess(["sudo", "ip", "link", "set", "can0", "up", "type", "can", "bitrate", "1000000"])
-                if result.returncode == 0:
-                    self.get_logger().info("CAN interface is up")
-                else:
-                    self.get_logger().info("CAN failed to setup")
-
-            self.bus = can.interface.Bus(bustype='socketcan', channel='can0', bitrate=1000000)
-            self.notifier = can.Notifier(self.bus, [self])
-        except:
-            result = run_subprocess(["sudo", "ip", "link", "set", "can0", "down"])
-            
-            if hasattr(self, 'bus'):
-                try:
-                    self.bus.shutdown()
-                except Exception as e:
-                    print(f"Error shutting down bus: {e}")
-                finally:
-                    delattr(self, 'bus')
-
-            if hasattr(self, 'notifier'):
-                try:
-                    self.notifier.stop()
-                except Exception as e:
-                    print(f"Error stopping notifier: {e}")
-                finally:
-                    delattr(self, 'notifier')
-
-            time.sleep(1)
-            self.setup_can_interface()
         
     def init_subscriber(self):
         self.motor_command_subscriber = self.create_subscription(MotorCommand, '/publish_motor', self.motor_command_callback, 10)
@@ -89,14 +99,14 @@ class CanDriver(Node, can.Listener):
         goal_bytes = struct.pack("<f", msg.goal)
         self.canMsgData[2:6] = goal_bytes
         
-        can_message = can.Message(arbitration_id=msg.can_id, data=self.canMsgData, is_extended_id=False)
-        self.bus.send(can_message)
+        can_message = can_msg(arbitration_id=msg.can_id, data=self.canMsgData)
+        self.send(can_message)
             
     def servo_command_callback(self, msg):
         servo_count = 4
         servo_value = [msg.servo1_value, msg.servo2_value, msg.servo3_value, msg.servo4_value]
 
-        for i in range(servo_count):
+        for i in range (servo_count):
             if servo_value[i] > 1.0:
                 servo_value[i] = 1.0
             elif servo_value[i] < 0.0:
@@ -110,14 +120,14 @@ class CanDriver(Node, can.Listener):
             if i == 0:
                 self.canMsgData[0] = self.canMsgData[0] | 0xC0
 
-        can_message = can.Message(arbitration_id=msg.can_id, data=self.canMsgData, is_extended_id=False)
-        self.bus.send(can_message)
+        can_message = can_msg(arbitration_id=msg.can_id, data=self.canMsgData)
+        self.send(can_message)
 
     def pwm_command_callback(self, msg):
         pwm_count = 4
         pwm_value = [msg.pwm1_value, msg.pwm2_value, msg.pwm3_value, msg.pwm4_value]
 
-        for i in range(pwm_count):
+        for i in range (pwm_count):
             if pwm_value[i] > 1.0:
                 pwm_value[i] = 1.0
             elif pwm_value[i] < 0.0:
@@ -131,8 +141,8 @@ class CanDriver(Node, can.Listener):
             if i == 0:
                 self.canMsgData[0] = self.canMsgData[0] | 0x80
 
-        can_message = can.Message(arbitration_id=msg.can_id, data=self.canMsgData, is_extended_id=False)
-        self.bus.send(can_message)
+        can_message = can_msg(arbitration_id=msg.can_id, data=self.canMsgData)
+        self.send(can_message)
 
     def digital_and_solenoid_command_callback(self, msg):
         digital_count = 4
@@ -145,14 +155,53 @@ class CanDriver(Node, can.Listener):
         self.canMsgData[1] = 0
         self.canMsgData[2] = 0
 
-        for i in range(digital_count):
+        for i in range (digital_count):
             self.canMsgData[1] |= (digital_value[i] << i)
         
         for i in range(solenoid_count):
             self.canMsgData[2] |= (solenoid_value[i] << i)
 
-        can_message = can.Message(arbitration_id=msg.can_id, data=self.canMsgData, is_extended_id=False)
-        self.bus.send(can_message)
+        can_message = can_msg(arbitration_id=msg.can_id, data=self.canMsgData)
+        self.send(can_message)
+   
+    def send(self, can_message):
+        data = can_message.convert_can_msg_to_serial(can_message)
+        self.transmit_serial_buffer.push(data)
+
+    def setup_serial_interface(self):
+        self.serial = serial.Serial(port=self.serial_port, baudrate=921600, rtscts=False, exclusive=True)
+        self.receive_serial_buffer = serial_buffer(4096)
+        self.transmit_serial_buffer = serial_buffer(4096)
+
+        self.can_message_structure = can_msg()
+        self.can_msg_received = can_msg()
+
+        serial_time_step = 1.0 / 300
+        self.serial_receive_timer = self.create_timer(serial_time_step, self.serial_receive_callback)
+        self.serial_transmit_timer = self.create_timer(serial_time_step, self.serial_transmit_callback)
+
+    def serial_transmit_callback(self):
+        length = self.transmit_serial_buffer.head - self.transmit_serial_buffer.tail
+        
+        if length >= 13:
+            data_to_transmit = self.transmit_serial_buffer.read(self.transmit_serial_buffer.tail, length)
+            self.transmit_serial_buffer.tail = self.transmit_serial_buffer.head
+        
+            self.serial.write(data_to_transmit)
+
+    def serial_receive_callback(self):     
+        if self.serial.in_waiting:
+            data = self.serial.read(self.serial.in_waiting)
+
+            self.receive_serial_buffer.push(data)
+            while self.receive_serial_buffer.head - self.receive_serial_buffer.tail >= self.can_msg_received.serial_size:
+                data = self.receive_serial_buffer.read(self.receive_serial_buffer.tail, self.can_msg_received.serial_size)
+                valid = self.can_msg_received.convert_serial_to_can_msg(data)
+                if valid:
+                    self.on_message_received(self.can_msg_received)
+                    self.receive_serial_buffer.tail += self.can_msg_received.serial_size
+                else:
+                    self.receive_serial_buffer.tail += 1
 
     def on_message_received(self, msg):
         if 128 < msg.arbitration_id < 256:
@@ -179,50 +228,19 @@ class CanDriver(Node, can.Listener):
 
             self.digital_and_analog_input_publisher.publish(feedback_msg)
 
-    def on_error(self,  exc):
-        if time.perf_counter() - self.error_timer > 1.0:
-            self.setup_can_interface()
-            self.error_timer = time.perf_counter()
-
-    def signal_handler(self, signum, frame):
-        """Handle shutdown signals gracefully."""
-        self.get_logger().info(f"Received signal {signum}. Initiating shutdown...")
-        self.shutdown_requested = True
-
     def shutdown(self):
-        """Shuts down the CAN interface and other resources gracefully."""
-        if self.shutdown_requested:
-            return
-        
-        self.get_logger().info("Shutdown requested. Cleaning up...")
-        self.shutdown_requested = True
-
-        # Stop all ongoing operations
-        self.notifier.stop()
-        
-        # Close the CAN bus
-        self.bus.shutdown()
-        
-        # Shutdown the can0 interface
-        result = run_subprocess(["sudo", "ip", "link", "set", "can0", "down"])
-        if result.returncode == 0:
-            self.get_logger().info("CAN interface successfully shut down.")
-        else:
-            self.get_logger().error("Failed to shut down CAN interface.")
-        
-        # Destroy the node.
-        self.destroy_node()
-        self.get_logger().info("Node destroyed. Shutdown complete.")
+        self.serial_transmit_timer.cancel()
+        self.serial_receive_timer.cancel()
 
 def main(args=None):
     rclpy.init(args=args)
     can_driver_node = CanDriver()
     try:
-        while rclpy.ok() and not can_driver_node.shutdown_requested:
-            rclpy.spin_once(can_driver_node, timeout_sec=0.1)
+        rclpy.spin(can_driver_node)
     except KeyboardInterrupt:
-        can_driver_node.shutdown()
+        pass
     finally:
+        can_driver_node.shutdown()
         rclpy.shutdown()
 
 if __name__ == '__main__':

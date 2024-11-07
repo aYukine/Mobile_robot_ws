@@ -23,6 +23,7 @@ setup(
     entry_points={
         'console_scripts': [
             'can_driver_node = can_driver.can_driver:main',
+            'can_driver_smarttek_node = can_driver.can_driver_smarttek:main'
         ],
     },
 )
