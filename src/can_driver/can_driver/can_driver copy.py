@@ -77,22 +77,6 @@ class CanDriver(Node, can.Listener):
         self.encoder_publisher = self.create_publisher(EncoderFeedback, '/encoder_feedback', 10)
         self.digital_and_analog_input_publisher = self.create_publisher(DigitalAndAnalogFeedback, '/digital_analog_feedback', 10)
 
-    def send_can_message(self, can_message):
-        """Helper method to send CAN messages with error handling"""
-        try:
-            self.bus.send(can_message)
-        except OSError as e:
-            if "no buffer space available" in str(e).lower():
-                self.get_logger().warn("Buffer space error, message dropped")
-            else:
-                # For other OSErrors, try to recover the CAN interface
-                self.get_logger().error(f"CAN send error: {str(e)}")
-                if time.perf_counter() - self.error_timer > 1.0:
-                    self.setup_can_interface()
-                    self.error_timer = time.perf_counter()
-        except Exception as e:
-            self.get_logger().error(f"Unexpected error sending CAN message: {str(e)}")
-
     def motor_command_callback(self, msg):
         self.canMsgData[0] = (
             msg.positionmode +
@@ -106,7 +90,7 @@ class CanDriver(Node, can.Listener):
         self.canMsgData[2:6] = goal_bytes
         
         can_message = can.Message(arbitration_id=msg.can_id, data=self.canMsgData, is_extended_id=False)
-        self.send_can_message(can_message)
+        self.bus.send(can_message)
             
     def servo_command_callback(self, msg):
         servo_count = 4
@@ -127,7 +111,7 @@ class CanDriver(Node, can.Listener):
                 self.canMsgData[0] = self.canMsgData[0] | 0xC0
 
         can_message = can.Message(arbitration_id=msg.can_id, data=self.canMsgData, is_extended_id=False)
-        self.send_can_message(can_message)
+        self.bus.send(can_message)
 
     def pwm_command_callback(self, msg):
         pwm_count = 4
@@ -148,15 +132,14 @@ class CanDriver(Node, can.Listener):
                 self.canMsgData[0] = self.canMsgData[0] | 0x80
 
         can_message = can.Message(arbitration_id=msg.can_id, data=self.canMsgData, is_extended_id=False)
-        self.send_can_message(can_message)
+        self.bus.send(can_message)
 
     def digital_and_solenoid_command_callback(self, msg):
         digital_count = 4
         solenoid_count = 6
 
         digital_value = [msg.digital1_value, msg.digital2_value, msg.digital3_value, msg.digital4_value]
-        solenoid_value = [msg.solenoid1_value, msg.solenoid2_value, msg.solenoid3_value, 
-                        msg.solenoid4_value, msg.solenoid5_value, msg.solenoid6_value]
+        solenoid_value = [msg.solenoid1_value, msg.solenoid2_value, msg.solenoid3_value, msg.solenoid4_value, msg.solenoid5_value, msg.solenoid6_value]
 
         self.canMsgData[0] = 0x40
         self.canMsgData[1] = 0
@@ -169,7 +152,8 @@ class CanDriver(Node, can.Listener):
             self.canMsgData[2] |= (solenoid_value[i] << i)
 
         can_message = can.Message(arbitration_id=msg.can_id, data=self.canMsgData, is_extended_id=False)
-        self.send_can_message(can_message)
+        self.bus.send(can_message)
+
     def on_message_received(self, msg):
         if 100 <= msg.arbitration_id < 200:
             feedback_msg = EncoderFeedback()
